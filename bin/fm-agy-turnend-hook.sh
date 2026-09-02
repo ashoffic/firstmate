@@ -83,7 +83,7 @@ set +e
 action=${1:-stop}
 payload=
 IFS= read -r payload || [ -n "$payload" ]
-trap 'printf "%%s\\n" "{}"' EXIT
+trap 'printf "%s\\n" "{}"' EXIT
 command -v jq >/dev/null 2>&1 || exit 0
 workspace=$(jq -er '(.workspacePaths // [])[0] // .cwd // empty' <<< "$payload" 2>/dev/null) || exit 0
 [ -n "$workspace" ] || exit 0

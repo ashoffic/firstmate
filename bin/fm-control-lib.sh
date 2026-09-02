@@ -174,8 +174,8 @@ fm_control_exit_command() {  # <harness>
 fm_control_backend_supports_key() {  # <backend> <key>
   local backend=${1-} key=${2-}
   case "$key" in
-    Enter|C-c|C-u) return 0 ;;
-    Escape)
+    Enter|C-c) return 0 ;;
+    C-u|Escape)
       case "$backend" in
         orca) return 1 ;;
         *) return 0 ;;
