@@ -99,6 +99,10 @@ type SessionGeneration = {
   // replacement began reads it to tell a main-queued wake (replayed) from a
   // branch-handled one (finished).
   unconsumedWakes: Map<string, UnconsumedWake>;
+  // A verified successor's failure close that arrived while the pipeline was
+  // still delivering the wake it was started for; its bounded retry runs once
+  // that delivery settles instead of being skipped by the single-flight guard.
+  deferredClose: { message: string; predecessorArmPid: string } | null;
 };
 
 function refreshWatchToolShell(
@@ -181,6 +185,9 @@ function replacementCoordinatorFor(handoff: string): ReplacementCoordinator {
 const replacementCoordinator = replacementCoordinatorFor(actionableHandoff);
 const armReadiness = new WeakMap<ChildProcess, Promise<boolean>>();
 const armClose = new WeakMap<ChildProcess, Promise<void>>();
+// Children the extension itself asked to exit; their close is not a failure
+// of the successor and never earns a deferred retry.
+const armRetired = new WeakSet<ChildProcess>();
 const armRecovery = new WeakMap<ChildProcess, { generation: string; watcherPid: string }>();
 const armPendingActionable = new WeakMap<ChildProcess, PendingActionableClose>();
 
@@ -414,6 +421,7 @@ function createGeneration(): SessionGeneration {
     pendingActionables: [],
     cleanupFailure: "",
     unconsumedWakes: new Map(),
+    deferredClose: null,
   };
 }
 
@@ -736,6 +744,9 @@ export default function (pi: ExtensionAPI) {
           }
         };
         try {
+          // A new restoration supersedes whatever became of the previous
+          // successor; only a failure during this delivery is retried after it.
+          owner.deferredClose = null;
           const restoration = await restoreAfterActionableClose(owner, pending.predecessorArmPid);
           if (!generationIsLive(owner)) {
             settleClaim("failed");
@@ -782,11 +793,19 @@ export default function (pi: ExtensionAPI) {
       if (generationIsLive(owner)) {
         owner.restoring = false;
         if (owner.pendingActionables.some((pending) => pending.delivered)) schedulePendingCleanup(owner);
-        // No arm is launched here. A generation without a child at this point
-        // has delivered a typed restoration failure after its bounded retries,
-        // and that message hands repair to main through fm_watch_arm_pi; one
-        // more silent launch past the bound could hold a hung child that the
-        // repair call would then report as "unchanged".
+        // No bare arm is launched here. A generation without a child at this
+        // point has either delivered a typed restoration failure after its
+        // bounded retries, which hands repair to main through fm_watch_arm_pi
+        // (one more silent launch past the bound could hold a hung child that
+        // the repair call would then report as "unchanged"), or lost a
+        // verified successor during the delivery, which takes the ordinary
+        // bounded, lock-checked retry it would have taken had the pipeline
+        // been idle.
+        const deferred = owner.deferredClose;
+        owner.deferredClose = null;
+        if (deferred && !owner.child && !owner.retryTimer) {
+          scheduleRetry(owner, deferred.message, deferred.predecessorArmPid);
+        }
       }
     }
   }
@@ -823,6 +842,7 @@ export default function (pi: ExtensionAPI) {
 
   async function retireArm(armChild: ChildProcess | null): Promise<boolean> {
     if (!armChild) return true;
+    armRetired.add(armChild);
     armChild.kill("SIGTERM");
     const closed = armClose.get(armChild);
     if (!closed) return false;
@@ -933,6 +953,7 @@ export default function (pi: ExtensionAPI) {
     let stderr = "";
     let settled = false;
     let readinessSettled = false;
+    let verified = false;
     let resolveReadiness: (ready: boolean) => void = () => {};
     let resolveClosed: () => void = () => {};
     const readiness = new Promise<boolean>((resolveReady) => {
@@ -946,6 +967,7 @@ export default function (pi: ExtensionAPI) {
     const settleReadiness = (ready: boolean): void => {
       if (readinessSettled) return;
       readinessSettled = true;
+      verified = ready;
       resolveReadiness(ready);
     };
     const observeEstablishedArm = (): void => {
@@ -989,7 +1011,17 @@ export default function (pi: ExtensionAPI) {
         void processPendingActionables(owner);
         return;
       }
-      if (!generationIsLive(owner) || owner.restoring) return;
+      if (!generationIsLive(owner)) return;
+      if (owner.restoring) {
+        // The pipeline is still delivering the wake this successor was
+        // started for. A verified successor that failed on its own keeps its
+        // bounded retry for the end of that delivery; an unready child closing
+        // here was retired by the restoration itself.
+        if (verified && !armRetired.has(armChild)) {
+          owner.deferredClose = { message: classification.message, predecessorArmPid: predecessor };
+        }
+        return;
+      }
       scheduleRetry(owner, classification.message, predecessor);
     });
     armChild.on("error", (error: Error) => {

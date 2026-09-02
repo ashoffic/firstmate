@@ -1107,6 +1107,7 @@ FM_PI_BRANCH_LIVE_E2E=1 FM_PI_PACKAGE_DIR=<pi-0.84.4 package> bin/fm-test-run.sh
 ```text
 ok - Pi hung successor falls back to one typed actionable wake
 ok - Pi streaming-time wake delivery keeps the successor chain and replays only unconsumed wakes
+ok - Pi retries a verified successor that failed during wake delivery once that delivery settles
 ok - tracked Pi extensions pass strict no-emit typecheck against Pi 0.84.4
 ok - real Pi SDK 0.84.4 queues a streaming-time watcher wake without before_agent_start, keeps the successor chain, and surfaces consumption of both follow-ups
 ```
@@ -1114,3 +1115,4 @@ ok - real Pi SDK 0.84.4 queues a streaming-time watcher wake without before_agen
 The live probe loads the tracked watcher extension through Pi's real resource loader into a real AgentSession whose only provider is a local fake with its fetch intercepted in-process and held open mid-stream.
 It proved that a follow-up the extension sends while main is streaming raises no `before_agent_start` at queue time or when the run reaches it, joins the run as a user `message_start` carrying the exact wake text in its own model turn, and is followed by a verified successor and delivery of the next close; a follow-up sent to the idle main raises `before_agent_start` with the exact text before its user `message_start`.
 The portable regression drives the same shape with a fake main that never raises `before_agent_start` while streaming, then proves a replacement replays only the follow-up Pi had not consumed and that an exhausted restoration delivers its typed failure without launching a further arm.
+A second regression holds a branch settlement open while the verified successor exits with a failure, and proves that failure takes the ordinary bounded retry once the delivery settles rather than leaving the generation with no watcher and no retry.
