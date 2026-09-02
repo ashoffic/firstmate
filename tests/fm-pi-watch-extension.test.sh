@@ -1217,9 +1217,9 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
+  // Nothing here consumes the follow-up: continuity must not depend on it.
   sendUserMessage: async (message) => {
     prompts.push(message);
-    queueMicrotask(() => handlers.get("before_agent_start")?.({ prompt: message }, {}));
   },
 };
 const rows = () => existsSync(process.env.FM_ARM_LOG)
@@ -2012,6 +2012,119 @@ EOF
   expect_code 0 "$status" "Pi replacement must replay a streaming follow-up before consumption"
   [ -z "$out" ] || fail "Pi streaming follow-up replacement test printed output: $out"
   pass "Pi replacement replays a streaming follow-up before consumption"
+}
+
+# The 2026-09-02 incident: a wake delivered while main was mid-turn never raised
+# before_agent_start, the extension waited for it, and every later actionable
+# close was dropped. Continuity must settle on Pi accepting the follow-up, while
+# consumption still decides what a replacement replays.
+test_pi_streaming_time_delivery_keeps_the_successor_chain() {
+  local repo home plugin log trigger out status
+  repo="$TMP_ROOT/pi-streaming-chain-root"
+  home="$TMP_ROOT/pi-streaming-chain-home"
+  log="$TMP_ROOT/pi-streaming-chain.log"
+  trigger="$TMP_ROOT/pi-streaming-chain.trigger"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --handling-delivered ]; then
+  printf 'confirmed=%s\n' "$2" >> "${FM_ARM_LOG:?}"
+  exit 0
+fi
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(grep -c '^arm=' "$FM_ARM_LOG")
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=chain-%s\n' "$$" "$count"
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_TRIGGER_FILE.$count" ]; do sleep 0.02; done
+printf 'signal: streaming chain wake %s\n' "$count"
+exit 0
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_TRIGGER_FILE="$trigger" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const prompts = [];
+let streaming = false;
+let beforeAgentStarts = 0;
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  registerCommand() {},
+  registerTool() {},
+  // The real Pi prompt path: a follow-up sent while the agent is streaming is
+  // queued for the running run and raises no before_agent_start; only a send
+  // to an idle agent starts a run and raises it with the exact text.
+  sendUserMessage: async (message) => {
+    prompts.push(message);
+    if (streaming) return;
+    beforeAgentStarts += 1;
+    handlers.get("before_agent_start")?.({ prompt: message }, {});
+  },
+  events: { on() {}, emit() {} },
+};
+// The running run reaching a queued follow-up: Pi emits the user message.
+const consumeQueued = (message) =>
+  handlers.get("message_start")?.({ message: { role: "user", content: [{ type: "text", text: message }] } }, {});
+const arms = () => existsSync(process.env.FM_ARM_LOG)
+  ? readFileSync(process.env.FM_ARM_LOG, "utf8").split("\n").filter((row) => row.startsWith("arm=")).length
+  : 0;
+async function waitFor(pred, label) {
+  for (let i = 0; i < 500; i += 1) {
+    if (pred()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timeout waiting for ${label}`);
+}
+const wakes = (text) => prompts.filter((message) => message.includes(text)).length;
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {});
+await waitFor(() => arms() === 1, "first arm");
+streaming = true;
+writeFileSync(`${process.env.FM_TRIGGER_FILE}.1`, "close\n");
+await waitFor(() => prompts.length === 1, "first wake delivered while main streams");
+if (wakes("signal: streaming chain wake 1") !== 1) throw new Error(`wrong first wake: ${prompts.join(" | ")}`);
+await waitFor(() => arms() === 2, "successor after the streaming-time delivery");
+writeFileSync(`${process.env.FM_TRIGGER_FILE}.2`, "close\n");
+await waitFor(() => prompts.length === 2, "second wake delivered while main still streams");
+if (wakes("signal: streaming chain wake 2") !== 1) throw new Error(`wrong second wake: ${prompts.join(" | ")}`);
+await waitFor(() => arms() === 3, "successor after the second streaming-time delivery");
+if (beforeAgentStarts !== 0) throw new Error(`streaming follow-ups raised before_agent_start ${beforeAgentStarts} times`);
+
+// The run reaches the first queued follow-up; the second is still queued when
+// the captain replaces the session, so only the second rides the handoff.
+consumeQueued(prompts[0]);
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "new" }, {});
+const handoffPath = `${process.env.FM_HOME}/state/extensions/pi-primary-watch/session-replacement-actionable.json`;
+const handoff = JSON.parse(readFileSync(handoffPath, "utf8"));
+if (handoff.pending.length !== 1 || handoff.pending[0].delivered || !handoff.pending[0].message.includes("signal: streaming chain wake 2")) {
+  throw new Error(`replacement handoff did not carry exactly the unconsumed wake: ${JSON.stringify(handoff)}`);
+}
+streaming = false;
+const replacementMod = await import(`${pathToFileURL(process.env.PLUGIN).href}?replacement=streaming-chain`);
+replacementMod.default(pi);
+await handlers.get("session_start")?.({ type: "session_start", reason: "new" }, {});
+await waitFor(() => prompts.length === 3, "replacement replay of the unconsumed wake");
+if (wakes("signal: streaming chain wake 2") !== 2 || wakes("signal: streaming chain wake 1") !== 1) {
+  throw new Error(`replacement replayed the wrong wakes: ${prompts.join(" | ")}`);
+}
+if (beforeAgentStarts !== 1) throw new Error(`idle replay raised before_agent_start ${beforeAgentStarts} times`);
+await waitFor(() => arms() === 4, "replacement arm");
+await waitFor(() => !existsSync(handoffPath), "consumed replay clears its handoff record");
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi streaming-time wake delivery must keep the successor chain and replay only unconsumed wakes"
+  [ -z "$out" ] || fail "Pi streaming-time delivery chain test printed output: $out"
+  pass "Pi streaming-time wake delivery keeps the successor chain and replays only unconsumed wakes"
 }
 
 test_pi_late_retiring_actionable_reaches_replacement() {
@@ -3413,6 +3526,7 @@ test_pi_arm_distinguishes_session_lock_ownership
 test_pi_session_transition_generation_owner
 test_pi_session_replacement_carries_inflight_actionable_close
 test_pi_streaming_followup_is_replayed_after_replacement
+test_pi_streaming_time_delivery_keeps_the_successor_chain
 test_pi_late_retiring_actionable_reaches_replacement
 test_pi_replacement_tokens_are_process_unique
 test_pi_replacement_persistence_failure_stops_arm_child
