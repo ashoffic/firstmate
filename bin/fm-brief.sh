@@ -203,6 +203,12 @@ The move IS the acknowledgement: without it firstmate rings again and eventually
 EOF
 INBOX_SECTION=${INBOX_SECTION%$'\n'}
 
+# AGENTS.md owns the fleet-wide external-research policy. This one-line
+# reinforcement is rendered in every brief because a newly launched worker
+# must receive the prohibition before it can load that durable owner.
+# shellcheck disable=SC2016 # Backticks are literal Markdown in the generated brief.
+EXTERNAL_RESEARCH_SECTION='Do not use Parallel, `parallel-cli`, the Parallel API, or any research skill or backend that routes queries through Parallel. Use ordinary web search for external research.'
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -229,6 +235,9 @@ You are a persistent second mate managed by the main firstmate. Work on your own
 
 # Charter
 $SECONDMATE_CHARTER
+
+# External research
+$EXTERNAL_RESEARCH_SECTION
 
 # Routing scope
 $SECONDMATE_SCOPE
@@ -349,6 +358,9 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 $TASK_SECTION
 
+# External research
+$EXTERNAL_RESEARCH_SECTION
+
 $HERDR_SECTION
 
 # Setup
@@ -420,6 +432,9 @@ cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
 $TASK_SECTION
+
+# External research
+$EXTERNAL_RESEARCH_SECTION
 
 $HERDR_SECTION
 
